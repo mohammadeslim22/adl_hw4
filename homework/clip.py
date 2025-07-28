@@ -94,69 +94,39 @@ class CaptionDatasetForTraining(Dataset):
 
 class CLIP(nn.Module):
     def __init__(
-        self, vision_encoder: nn.Module, text_encoder: nn.Module, proj_dim: int = 64, temperature: float = 0.07
+        self, vision_encoder: nn.Module, text_encoder: nn.Module, proj_dim: int = 256, temperature: float = 0.07
     ):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
-        # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
+
+        # Projection heads to align image/text features
+        self.image_proj = nn.Linear(self.vision_encoder.config.hidden_size, proj_dim)
+        self.text_proj = nn.Linear(self.text_encoder.config.hidden_size, proj_dim)
+
+        self.temperature = nn.Parameter(torch.tensor(temperature))
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        return self.vision_encoder(image)
+        vision_outputs = self.vision_encoder(image).last_hidden_state[:, 0]
+        return self.image_proj(vision_outputs)
 
-    def encode_text(self, text: str) -> torch.Tensor:
-        return self.text_encoder(text)
-
-    def save_pretrained(self, save_directory: str, **kwargs):
-        """Customize save method, save additional parameters"""
-
-        additional_state_dict = {}
-        for name, param in self.named_parameters():
-            if "vision_encoder." in name or "text_encoder." in name:
-                continue
-            additional_state_dict[name] = param.data
-
-        torch.save(additional_state_dict, Path(save_directory) / "additional_weights.pt")
-
-    def load_pretrained(self, load_directory: str, **kwargs):
-        """Customize load method, load projection additional parameters"""
-
-        additional_weights_path = Path(load_directory) / "additional_weights.pt"
-        if additional_weights_path.exists():
-            additional_state_dict = torch.load(additional_weights_path, map_location="cpu")
-
-            for name, param in self.named_parameters():
-                if "vision_encoder." in name or "text_encoder." in name:
-                    continue
-                param.data = additional_state_dict[name]
+    def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        text_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0]
+        return self.text_proj(text_outputs)
 
     def set_trainable_parameters(self):
-        for name, param in self.named_parameters():
-            if "vision_encoder." in name or "text_encoder." in name:
-                continue
+        # Freeze the vision and text encoders
+        for param in self.vision_encoder.parameters():
+            param.requires_grad = False
+        for param in self.text_encoder.parameters():
+            param.requires_grad = False
+
+        # Only train projection layers and temperature
+        for param in self.image_proj.parameters():
             param.requires_grad = True
-
-    def gradient_checkpointing_enable(self, **kwargs):
-        """
-        Enable gradient checkpointing for the vision and text backbones.
-        (You don't need to touch this method)
-        """
-        self.vision_encoder.gradient_checkpointing_enable(**kwargs)
-        self.text_encoder.gradient_checkpointing_enable(**kwargs)
-
-    def enable_input_require_grads(self):
-        """
-        Enable input require grads for the vision and text backbones.
-        (You don't need to touch this method)
-        """
-
-        # Reference: https://discuss.huggingface.co/t/peft-lora-gpt-neox-backward-pass-failing/35641
-        def make_inputs_require_grads(module, input, output):  # noqa: A002
-            output.requires_grad_(True)
-
-        self.vision_encoder.embeddings.register_forward_hook(make_inputs_require_grads)
-        self.text_encoder.get_input_embeddings().register_forward_hook(make_inputs_require_grads)
+        for param in self.text_proj.parameters():
+            param.requires_grad = True
+        self.temperature.requires_grad = True
 
     def forward(
         self,
@@ -166,19 +136,18 @@ class CLIP(nn.Module):
         labels: torch.Tensor = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for the CLIP model.
-        Args:
-            pixel_values: The pixel values of the image.
-            input_ids: The input ids of the text.
-            attention_mask: The attention mask of the text.
-            labels: The labels for the text features.
-            (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-            (Hint: refer to returned values of the __getitem__ method in the CaptionDatasetForTraining class)
-        Returns:
-            TODO: think about the what values should be returned
-        """
-        raise NotImplementedError("Not implemented")
+        image_embeds = self.encode_image(pixel_values)
+        text_embeds = self.encode_text(input_ids, attention_mask)
+
+        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+
+        # Similarity scores
+        logits_per_image = torch.matmul(image_embeds, text_embeds.T) * self.temperature.exp()
+        logits_per_text = logits_per_image.T
+
+        return image_embeds, text_embeds, logits_per_image
+
 
 
 def compute_clip_loss(
@@ -186,18 +155,13 @@ def compute_clip_loss(
     labels: torch.Tensor,
     num_items_in_batch: int | None = None,
 ) -> torch.Tensor:
-    """
-    Compute the loss for the CLIP model.
-    Args:
-        outputs: A tuple containing the outputs of CLIP.forward().
-        labels: The labels for the text features.
-        (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
-        num_items_in_batch: The number of items in the batch.
-        (NOTE: you don't need to use the variable `num_items_in_batch`, this is just for compatibility with Trainer)
-    Returns:
-        The loss for the CLIP model.
-    """
-    raise NotImplementedError("Not implemented")
+    _, _, logits_per_image = outputs
+    batch_size = logits_per_image.size(0)
+    labels = torch.arange(batch_size, device=logits_per_image.device)
+    loss_i2t = nn.CrossEntropyLoss()(logits_per_image, labels)
+    loss_t2i = nn.CrossEntropyLoss()(logits_per_image.T, labels)
+    return (loss_i2t + loss_t2i) / 2
+
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
@@ -218,10 +182,11 @@ def train(
     data_dir: Path | None = None,
     output_dir: str = "clip",
     num_train_epochs: float = 1,
-    per_device_train_batch_size: int = 1024,
+    per_device_train_batch_size: int = 32,
     gradient_accumulation_steps: int = 1,
     learning_rate: float = 5e-4,
-    num_workers: int = 16,
+    pin_memory=False,
+    num_workers: int = 0,
 ):
     vlm = BaseVLM()
 
@@ -253,8 +218,8 @@ def train(
     model.print_trainable_parameters()
     model.to(device)
     model.train()
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
+    # model.gradient_checkpointing_enable()
+    # model.enable_input_require_grads()
 
     # load dataset
     train_dataset = CaptionDataset("train", data_dir)
@@ -267,7 +232,7 @@ def train(
         num_train_epochs=num_train_epochs,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
         learning_rate=learning_rate,
         bf16=True if device == "cuda" else False,
         logging_steps=1,
@@ -275,7 +240,7 @@ def train(
         save_steps=50,
         save_total_limit=2,
         label_names=["labels"],
-        dataloader_num_workers=num_workers,
+        dataloader_num_workers=0,
     )
 
     trainer = Trainer(
