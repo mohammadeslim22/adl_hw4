@@ -9,9 +9,11 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoProcessor, Trainer, TrainingArguments
+import numpy as np
 
 from .base_vlm import BaseVLM
 from .data import CaptionDataset, MultiChoiceQADataset
+import torch.nn.functional as F
 
 processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct")
 
@@ -94,60 +96,128 @@ class CaptionDatasetForTraining(Dataset):
 
 class CLIP(nn.Module):
     def __init__(
-        self, vision_encoder: nn.Module, text_encoder: nn.Module, proj_dim: int = 256, temperature: float = 0.07
+            self, vision_encoder: nn.Module, text_encoder: nn.Module, proj_dim: int = 256, temperature: float = 0.07
     ):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
 
-        # Projection heads to align image/text features
+        # Image and text projection layers
         self.image_proj = nn.Linear(self.vision_encoder.config.hidden_size, proj_dim)
         self.text_proj = nn.Linear(self.text_encoder.config.hidden_size, proj_dim)
 
-        self.temperature = nn.Parameter(torch.tensor(temperature))
+        # Temperature parameter (log scale for stability)
+        self.log_temperature = nn.Parameter(torch.tensor(np.log(temperature), dtype=torch.float32))
+
+        # Learnable logit scale initialized from CLIP paper (log(1/0.07) ≈ 2.659)
+        self.logit_scale = torch.nn.Parameter(torch.tensor(2.659))
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        vision_outputs = self.vision_encoder(image).last_hidden_state[:, 0]
-        return self.image_proj(vision_outputs)
+        return self.vision_encoder(image)
 
-    def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        text_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0]
-        return self.text_proj(text_outputs)
+    def encode_text(self, text: str) -> torch.Tensor:
+        return self.text_encoder(text)
+
+    def save_pretrained(self, save_directory: str, **kwargs):
+        """Customize save method, save additional parameters"""
+
+        additional_state_dict = {}
+        for name, param in self.named_parameters():
+            if "vision_encoder." in name or "text_encoder." in name:
+                continue
+            additional_state_dict[name] = param.data
+
+        torch.save(additional_state_dict, Path(save_directory) / "additional_weights.pt")
+
+    def load_pretrained(self, load_directory: str, **kwargs):
+        """Customize load method, load projection additional parameters"""
+
+        additional_weights_path = Path(load_directory) / "additional_weights.pt"
+        if additional_weights_path.exists():
+            additional_state_dict = torch.load(additional_weights_path, map_location="cpu")
+
+            for name, param in self.named_parameters():
+                if "vision_encoder." in name or "text_encoder." in name:
+                    continue
+                param.data = additional_state_dict[name]
 
     def set_trainable_parameters(self):
-        # Freeze the vision and text encoders
-        for param in self.vision_encoder.parameters():
-            param.requires_grad = False
-        for param in self.text_encoder.parameters():
-            param.requires_grad = False
+        for name, param in self.named_parameters():
+            if "vision_encoder." in name or "text_encoder." in name:
+                continue
+            param.requires_grad = True
 
-        # Only train projection layers and temperature
-        for param in self.image_proj.parameters():
-            param.requires_grad = True
-        for param in self.text_proj.parameters():
-            param.requires_grad = True
-        self.temperature.requires_grad = True
+    def gradient_checkpointing_enable(self, **kwargs):
+        """
+        Enable gradient checkpointing for the vision and text backbones.
+        (You don't need to touch this method)
+        """
+        self.vision_encoder.gradient_checkpointing_enable(**kwargs)
+        self.text_encoder.gradient_checkpointing_enable(**kwargs)
+
+    def enable_input_require_grads(self):
+        """
+        Enable input require grads for the vision and text backbones.
+        (You don't need to touch this method)
+        """
+
+        # Reference: https://discuss.huggingface.co/t/peft-lora-gpt-neox-backward-pass-failing/35641
+        def make_inputs_require_grads(module, input, output):  # noqa: A002
+            output.requires_grad_(True)
+
+        self.vision_encoder.embeddings.register_forward_hook(make_inputs_require_grads)
+        self.text_encoder.get_input_embeddings().register_forward_hook(make_inputs_require_grads)
+
+    def mean_pool_text(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        mask = attention_mask.unsqueeze(-1).type_as(hidden_states)  # [B, L, 1]
+        masked_embeddings = hidden_states * mask
+        summed = masked_embeddings.sum(dim=1)  # [B, H]
+        counts = mask.sum(dim=1).clamp(min=1e-6)  # [B, 1]
+        return summed / counts
+
+    def mean_pool_vision(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states.mean(dim=1)  # Average over patch tokens [B, N, H] -> [B, H]
 
     def forward(
-        self,
-        pixel_values: torch.Tensor,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor = None,
-        labels: torch.Tensor = None,
-        **kwargs,
+            self,
+            pixel_values: torch.Tensor,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor = None,
+            labels: torch.Tensor = None,
+            **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        image_embeds = self.encode_image(pixel_values)
-        text_embeds = self.encode_text(input_ids, attention_mask)
+        """
+        Forward pass for the CLIP model.
+        Args:
+            pixel_values: The pixel values of the image.
+            input_ids: The input ids of the text.
+            attention_mask: The attention mask of the text.
+            labels: The labels for the text features.
+            (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
+            (Hint: refer to returned values of the __getitem__ method in the CaptionDatasetForTraining class)
+        Returns:
+            TODO: think about the what values should be returned
+        """
+        # === Text encoder ===
+        text_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+        text_hidden_states = text_outputs.last_hidden_state  # [B, L, H]
+        text_pooled = self.mean_pool_text(text_hidden_states, attention_mask)  # [B, H]
+        text_embeds = self.text_proj(text_pooled)  # [B, D]
+        text_embeds = F.normalize(text_embeds, dim=-1)
 
-        image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
-        text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+        # === Vision encoder ===
+        vision_outputs = self.vision_encoder(pixel_values)
+        vision_hidden_states = vision_outputs.last_hidden_state  # [B, N, H]
+        image_pooled = self.mean_pool_vision(vision_hidden_states)  # [B, H]
+        image_embeds = self.image_proj(image_pooled)  # [B, D]
+        image_embeds = F.normalize(image_embeds, dim=-1)
 
-        # Similarity scores
-        logits_per_image = torch.matmul(image_embeds, text_embeds.T) * self.temperature.exp()
-        logits_per_text = logits_per_image.T
+        # === Compute scaled similarity logits ===
+        logit_scale = self.logit_scale.exp().clamp(1e-3, 100.0)
+        logits_per_image = logit_scale * image_embeds @ text_embeds.t()  # [B, B]
+        logits_per_text = logits_per_image.t()  # [B, B]
 
-        return image_embeds, text_embeds, logits_per_image
-
+        return image_embeds, text_embeds, self.logit_scale
 
 
 def compute_clip_loss(
@@ -155,12 +225,32 @@ def compute_clip_loss(
     labels: torch.Tensor,
     num_items_in_batch: int | None = None,
 ) -> torch.Tensor:
-    _, _, logits_per_image = outputs
-    batch_size = logits_per_image.size(0)
-    labels = torch.arange(batch_size, device=logits_per_image.device)
-    loss_i2t = nn.CrossEntropyLoss()(logits_per_image, labels)
-    loss_t2i = nn.CrossEntropyLoss()(logits_per_image.T, labels)
-    return (loss_i2t + loss_t2i) / 2
+    """
+    Compute the loss for the CLIP model.
+    Args:
+        outputs: A tuple containing the outputs of CLIP.forward().
+        labels: The labels for the text features.
+        (NOTE: you don't need to use the variable `labels`, this is just for compatibility with the Trainer class)
+        num_items_in_batch: The number of items in the batch.
+        (NOTE: you don't need to use the variable `num_items_in_batch`, this is just for compatibility with Trainer)
+    Returns:
+        The loss for the CLIP model.
+    """
+    image_embeds, text_embeds, log_temperature = outputs
+
+    # Compute cosine similarity logits
+    logits = image_embeds @ text_embeds.T
+    logits = logits * log_temperature.exp()
+
+    # Matching labels: i-th image matches i-th text
+    n = logits.shape[0]
+    labels = torch.arange(n, device=logits.device)
+
+    # Symmetric cross-entropy loss
+    loss_i = F.cross_entropy(logits, labels)       # Image → Text
+    loss_t = F.cross_entropy(logits.T, labels)     # Text → Image
+    loss = (loss_i + loss_t) / 2
+    return loss
 
 
 
@@ -256,6 +346,7 @@ def train(
     # save model
     trainer.save_model(output_dir)
     model.model.save_pretrained(output_dir)
+    # torch.save(model.model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
 
     writer.close()
 
